@@ -104,32 +104,71 @@ export async function fetchLiveSingaporePsiData(
   }
 
   try {
-    const [psiRes, pm25Res] = await Promise.all([
-      fetch('https://api.data.gov.sg/v1/environment/psi', { cache: 'no-store' }),
-      fetch('https://api.data.gov.sg/v1/environment/pm25', { cache: 'no-store' }).catch(() => null),
-    ]);
+    // 1. Attempt to query our serverless /api/psi route first
+    let readingsRaw: Record<string, Record<string, number>> | null = null;
+    let timestamp = new Date().toISOString();
+    let updateTimestamp = new Date().toLocaleTimeString('en-SG', { timeZone: 'Asia/Singapore', hour: '2-digit', minute: '2-digit' });
 
-    if (!psiRes.ok) {
-      throw new Error(`NEA PSI API error: ${psiRes.statusText}`);
+    try {
+      const serverlessRes = await fetch('/api/psi', { cache: 'no-store' });
+      if (serverlessRes.ok) {
+        const serverlessJson = await serverlessRes.json();
+        if (serverlessJson.status === 'success' && serverlessJson.readings) {
+          readingsRaw = serverlessJson.readings;
+          timestamp = serverlessJson.timestamp || timestamp;
+          updateTimestamp = serverlessJson.updatedTimestamp || updateTimestamp;
+        }
+      }
+    } catch {
+      // In static preview, /api may not have Express server running yet; proceed to direct fallback
     }
 
-    const psiData: DataGovPsiResponse = await psiRes.json();
-    const pm25Data: DataGovPm25Response | null = pm25Res && pm25Res.ok ? await pm25Res.json() : null;
-
-    const latestItem = psiData.items?.[psiData.items.length - 1];
-    if (!latestItem) {
-      throw new Error('No telemetry items found in NEA PSI response');
+    // 2. Fallback to direct data.gov.sg v2 endpoint if /api/psi didn't return
+    if (!readingsRaw) {
+      try {
+        const v2Res = await fetch('https://api-open.data.gov.sg/v2/real-time/api/psi', { cache: 'no-store' });
+        if (v2Res.ok) {
+          const v2Json = await v2Res.json();
+          const latestItem = v2Json.data?.items?.[v2Json.data.items.length - 1];
+          if (latestItem?.readings) {
+            readingsRaw = latestItem.readings;
+            timestamp = latestItem.timestamp;
+            updateTimestamp = latestItem.updatedTimestamp || updateTimestamp;
+          }
+        }
+      } catch {
+        // Continue to v1 fallback
+      }
     }
 
-    const pm25LatestItem = pm25Data?.items?.[pm25Data.items.length - 1];
-    const readingsRaw = latestItem.readings;
+    // 3. Fallback to v1 endpoint
+    if (!readingsRaw) {
+      const [psiRes, pm25Res] = await Promise.all([
+        fetch('https://api.data.gov.sg/v1/environment/psi', { cache: 'no-store' }),
+        fetch('https://api.data.gov.sg/v1/environment/pm25', { cache: 'no-store' }).catch(() => null),
+      ]);
+
+      if (psiRes.ok) {
+        const psiData: DataGovPsiResponse = await psiRes.json();
+        const latestItem = psiData.items?.[psiData.items.length - 1];
+        if (latestItem) {
+          readingsRaw = latestItem.readings;
+          timestamp = latestItem.timestamp;
+          updateTimestamp = latestItem.update_timestamp || updateTimestamp;
+        }
+      }
+    }
+
+    if (!readingsRaw) {
+      throw new Error('Unable to retrieve readings from /api/psi or data.gov.sg endpoints');
+    }
 
     const regionKeys: RegionKey[] = ['national', 'central', 'north', 'south', 'east', 'west'];
     const readings: Record<RegionKey, PollutantReadings> = {} as any;
 
     regionKeys.forEach((key) => {
-      const psi24h = readingsRaw.psi_twenty_four_hourly?.[key] ?? 45;
-      const pm25_1h = pm25LatestItem?.readings?.pm25_one_hourly?.[key] ?? readingsRaw.pm25_twenty_four_hourly?.[key] ?? 18;
+      const psi24h = readingsRaw[key] ?? readingsRaw.psi_twenty_four_hourly?.[key] ?? 50;
+      const pm25_1h = readingsRaw.pm25_twenty_four_hourly?.[key] ?? 18;
       const pm25_24 = readingsRaw.pm25_twenty_four_hourly?.[key] ?? 16;
       const pm10_24 = readingsRaw.pm10_twenty_four_hourly?.[key] ?? 24;
       const o3_8h = readingsRaw.o3_eight_hour_max?.[key] ?? 28;
@@ -138,27 +177,34 @@ export async function fetchLiveSingaporePsiData(
       const co_8h = readingsRaw.co_eight_hour_max?.[key] ?? 0.5;
 
       readings[key] = {
-        psi24h,
-        pm25Hourly: pm25_1h,
-        pm25_24h: pm25_24,
-        pm10_24h: pm10_24,
-        o3_8hMax: o3_8h,
-        no2_1hMax: no2_1h,
-        so2_24h: so2_24,
-        co_8hMax: co_8h,
+        psi24h: typeof psi24h === 'number' ? psi24h : 50,
+        pm25Hourly: typeof pm25_1h === 'number' ? pm25_1h : 18,
+        pm25_24h: typeof pm25_24 === 'number' ? pm25_24 : 16,
+        pm10_24h: typeof pm10_24 === 'number' ? pm10_24 : 24,
+        o3_8hMax: typeof o3_8h === 'number' ? o3_8h : 28,
+        no2_1hMax: typeof no2_1h === 'number' ? no2_1h : 20,
+        so2_24h: typeof so2_24 === 'number' ? so2_24 : 6,
+        co_8hMax: typeof co_8h === 'number' ? co_8h : 0.5,
       };
     });
 
+    // If national wasn't explicitly supplied, compute average
+    if (!readings.national.psi24h || readings.national.psi24h === 50) {
+      const sub = [readings.central.psi24h, readings.north.psi24h, readings.south.psi24h, readings.east.psi24h, readings.west.psi24h];
+      readings.national.psi24h = Math.round(sub.reduce((a, b) => a + b, 0) / sub.length);
+      const subPm = [readings.central.pm25Hourly, readings.north.pm25Hourly, readings.south.pm25Hourly, readings.east.pm25Hourly, readings.west.pm25Hourly];
+      readings.national.pm25Hourly = Math.round(subPm.reduce((a, b) => a + b, 0) / subPm.length);
+    }
+
     const regions = buildRegionRecord(readings);
-    const updateTime = new Date(latestItem.update_timestamp || latestItem.timestamp);
+    const updateDate = new Date(updateTimestamp || timestamp);
+    const formattedUpdateTime = !isNaN(updateDate.getTime())
+      ? updateDate.toLocaleTimeString('en-SG', { timeZone: 'Asia/Singapore', hour: '2-digit', minute: '2-digit' })
+      : updateTimestamp;
 
     return {
-      timestamp: latestItem.timestamp,
-      updateTimestamp: updateTime.toLocaleTimeString('en-SG', {
-        timeZone: 'Asia/Singapore',
-        hour: '2-digit',
-        minute: '2-digit',
-      }),
+      timestamp,
+      updateTimestamp: formattedUpdateTime,
       regions,
       nationalPsi: readings.national.psi24h,
       nationalPm25: readings.national.pm25Hourly,
