@@ -1,0 +1,6 @@
+{
+  "name": "Singapore PSI Air Quality Live Monitor & Alert System",
+  "description": "Real-time Singapore PSI & PM2.5 air quality tracker with interactive regional map, NEA telemetry, threshold alerts, and push notifications.",
+  "requestFramePermissions": ["notifications"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
